@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Heart Disease AI Agent</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<h2>❤️ Heart Disease Prediction AI Agent</h2>
+
+<form action="/predict" method="post">
+    <input type="text" name="age" placeholder="Age"><br><br>
+    <input type="text" name="sex" placeholder="Gender (1=Male,0=Female)"><br><br>
+    <input type="text" name="cp" placeholder="Chest Pain Type"><br><br>
+    <input type="text" name="trestbps" placeholder="BP"><br><br>
+    <input type="text" name="chol" placeholder="Cholesterol"><br><br>
+    <input type="text" name="fbs" placeholder="Fasting Sugar"><br><br>
+    <input type="text" name="restecg" placeholder="ECG"><br><br>
+    <input type="text" name="thalach" placeholder="Max Heart Rate"><br><br>
+    <input type="text" name="exang" placeholder="Exercise Angina"><br><br>
+    <input type="text" name="oldpeak" placeholder="Oldpeak"><br><br>
+    <input type="text" name="slope" placeholder="Slope"><br><br>
+    <input type="text" name="ca" placeholder="CA"><br><br>
+    <input type="text" name="thal" placeholder="Thal"><br><br>
+
+    <button type="submit">Predict</button>
+</form>
+
+<h3>{{ prediction_text }}</h3>
+
+<hr>
+
+<!-- CHATBOT -->
+<h3>💬 Chat with AI Assistant</h3>
+
+<input type="text" id="userInput" placeholder="Ask something...">
+<button onclick="sendMessage()">Send</button>
+
+<p id="chatResponse"></p>
+
+
+<!-- JAVASCRIPT -->
+<script>
+function sendMessage() {
+    let message = document.getElementById("userInput").value;
+
+    fetch("/chat", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: "message=" + message
+    })
+    .then(response => response.text())
+    .then(data => {
+        document.getElementById("chatResponse").innerText = data;
+    });
+}
+</script>
+
+</body>
+</html>
