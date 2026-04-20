@@ -6,3 +6,4 @@ Pillow
 fpdf
 requests
 python-dotenv
+openai

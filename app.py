@@ -2,6 +2,7 @@ from datetime import datetime
 import hashlib
 import html
 import hmac
+import os
 from io import BytesIO
 import json
 import math
@@ -10,6 +11,7 @@ from pathlib import Path
 import pickle
 import secrets
 import sqlite3
+from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urlencode
 from urllib.request import Request, urlopen
@@ -17,12 +19,24 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from dotenv import load_dotenv
 from fpdf import FPDF
 from PIL import Image, ImageOps
 from assistant_memory import get_memory, save_memory, update_memory, MemoryResult
 from vectorstore import get_vectorstore
+
+try:
+    from openai import OpenAI, APIError, APIConnectionError
+except ImportError:
+    OpenAI = None
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
+OPENAI_MODEL = "gpt-4o-mini"
 
 
 MODEL_PATH = Path("model.pkl")
@@ -292,6 +306,29 @@ def _safe_extract_name(message: str):
     return None
 
 
+def _safe_extract_age(message: str):
+    """Extract age from user message in various formats."""
+    patterns = [
+        r"i am (\d+) years? old",
+        r"i'm (\d+) years? old",
+        r"age[:\s]+(\d+)",
+        r"my age is (\d+)",
+        r"age (\d+)",
+        r"(\d+) year[s]? old",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            age_str = match.group(1).strip()
+            try:
+                age = int(age_str)
+                if 1 <= age <= 150:  # Sanity check
+                    return age
+            except ValueError:
+                continue
+    return None
+
+
 def _find_symptoms(message: str):
     text = message.lower()
     symptoms = []
@@ -332,16 +369,177 @@ def _build_chat_greeting(user_id: str) -> str:
 
 
 def _build_chat_response(message: str, user_id: str) -> dict:
+    history_payload = []
+    if "chat_history" in st.session_state:
+        for entry in st.session_state.chat_history[-10:]:
+            role = "assistant" if entry.get("speaker") == "HealthBot" else "user"
+            history_payload.append({"role": role, "content": entry.get("message", "")})
+
+    try:
+        response = requests.post(
+            "http://127.0.0.1:5000/chat",
+            json={"user_id": user_id, "message": message, "history": history_payload},
+            timeout=8
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException:
+        # Fallback to local logic if Flask is not available
+        return _build_chat_response_fallback(message, user_id)
+
+
+def _build_openai_chat_response(message: str, user_id: str) -> Optional[str]:
+    if not OPENAI_CLIENT or not OPENAI_API_KEY:
+        return None
+
+    memory_context = {
+        "name": _read_chat_memory(user_id, "name"),
+        "age": _read_chat_memory(user_id, "age"),
+        "symptoms": _read_chat_memory(user_id, "symptoms"),
+        "previous_risk": _read_chat_memory(user_id, "previous_risk"),
+    }
+
+    history_payload = []
+    if "chat_history" in st.session_state:
+        for entry in st.session_state.chat_history[-10:]:
+            role = "assistant" if entry.get("speaker") == "HealthBot" else "user"
+            history_payload.append({"role": role, "content": entry.get("message", "")})
+
+    system_prompt = """You are a compassionate, practical, and knowledgeable healthcare AI assistant specializing in heart health.
+
+Your responsibilities:
+1. Listen carefully to patient concerns and symptoms.
+2. Provide evidence-based health information.
+3. Recognize warning signs of serious conditions.
+4. Always give concrete next steps and suggestions.
+5. Encourage professional medical consultation when appropriate.
+
+Guidelines:
+- For serious symptoms (chest pain, severe shortness of breath, dizziness with syncope): STRONGLY recommend immediate doctor/ER evaluation.
+- For moderate symptoms: suggest specific tests like ECG, Blood Pressure monitoring, or a cholesterol panel.
+- For low-risk cases: suggest prevention, monitoring, and follow-up care.
+- If the user lacks detail, ask one clear follow-up question.
+- Include at least one actionable recommendation or practical next step.
+- Keep responses concise, warm, and easy to understand.
+- Use simple, clear language (avoid jargon).
+- Never provide a definitive diagnosis or medication advice.
+- Do not replace professional medical consultation.
+"""
+
+    context_parts = []
+    if memory_context["name"]:
+        context_parts.append(f"User name: {memory_context['name']}")
+    if memory_context["age"] is not None:
+        context_parts.append(f"Age: {memory_context['age']}")
+    if memory_context["symptoms"]:
+        context_parts.append(f"Reported symptoms: {', '.join(memory_context['symptoms'])}")
+    if memory_context["previous_risk"] is not None:
+        context_parts.append(f"Previous risk score: {float(memory_context['previous_risk']):.1%}")
+
+    user_content = "".join([part + ". " for part in context_parts]) + f"Patient says: {message}"
+    messages = [{"role": "system", "content": system_prompt}] + history_payload + [{"role": "user", "content": user_content}]
+
+    try:
+        response = OPENAI_CLIENT.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=220,
+            timeout=12,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        try:
+            response = OPENAI_CLIENT.responses.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=220,
+                timeout=12,
+            )
+            if hasattr(response, "output_text") and response.output_text:
+                return response.output_text.strip()
+            if hasattr(response, "output") and response.output:
+                output = response.output
+                if isinstance(output, list) and output:
+                    first = output[0]
+                    if isinstance(first, dict) and first.get("content"):
+                        content = first["content"]
+                        if isinstance(content, list) and content:
+                            return content[0].get("text", "").strip()
+            return None
+        except Exception:
+            return None
+
+
+def _build_chat_response_fallback(message: str, user_id: str) -> dict:
     normalized = message.strip()
     details = {"memory_actions": []}
     vectorstore = get_vectorstore()
+    
+    # Extract and store ALL information first before deciding what to respond
+    extracted_name = _safe_extract_name(normalized)
+    extracted_age = _safe_extract_age(normalized)
+    extracted_symptoms = _find_symptoms(normalized)
+    
+    # Store any extracted information
+    if extracted_name:
+        _store_chat_memory(user_id, "name", extracted_name)
+        details["memory_actions"].append({"key": "name", "value": extracted_name})
+    
+    if extracted_age is not None:
+        _store_chat_memory(user_id, "age", extracted_age)
+        details["memory_actions"].append({"key": "age", "value": extracted_age})
+    
+    if extracted_symptoms:
+        existing_symptoms = _read_chat_memory(user_id, "symptoms") or []
+        merged = _merge_symptom_lists(existing_symptoms, extracted_symptoms)
+        _store_chat_memory(user_id, "symptoms", merged)
+        details["memory_actions"].append({"key": "symptoms", "value": merged})
 
-    name = _safe_extract_name(normalized)
-    if name:
-        _store_chat_memory(user_id, "name", name)
-        details["memory_actions"].append({"key": "name", "value": name})
+    if OPENAI_CLIENT and OPENAI_API_KEY:
+        ai_response = _build_openai_chat_response(message, user_id)
+        if ai_response:
+            return {"response": ai_response, "details": details}
+
+    # Now decide what to respond based on what was extracted
+    if extracted_name and not extracted_age and not extracted_symptoms:
+        stored_name = _read_chat_memory(user_id, "name")
         return {
-            "response": f"Nice to meet you, {name}. I will remember your name for future conversations.",
+            "response": f"Nice to meet you, {stored_name}. I will remember your name for future conversations.",
+            "details": details,
+        }
+    
+    if extracted_age is not None and not extracted_name and not extracted_symptoms:
+        return {
+            "response": f"Got it! I've noted that you are {extracted_age} years old. This will help me provide better health guidance.",
+            "details": details,
+        }
+    
+    if extracted_symptoms and not extracted_name and not extracted_age:
+        merged_symptoms = _read_chat_memory(user_id, "symptoms") or []
+        serious = any(symptom in ["chest pain", "shortness of breath", "irregular heartbeat", "pain in left arm", "pain in jaw"] for symptom in merged_symptoms)
+        if serious:
+            suggestion_text = "This sounds concerning. Please seek medical attention promptly and consider an ECG, blood pressure check, and clinical review."
+        else:
+            suggestion_text = "Monitor these symptoms, schedule a checkup, and consider a blood pressure or cholesterol screening if they continue."
+        return {
+            "response": f"I have noted your symptoms: {', '.join(merged_symptoms)}. {suggestion_text}",
+            "details": details,
+        }
+
+    # If multiple fields extracted, acknowledge all
+    if extracted_name or extracted_age or extracted_symptoms:
+        responses = []
+        if extracted_name:
+            responses.append(f"Nice to meet you, {extracted_name}")
+        if extracted_age is not None:
+            responses.append(f"noted your age is {extracted_age}")
+        if extracted_symptoms:
+            responses.append(f"recorded symptoms: {', '.join(extracted_symptoms)}")
+        combined_response = ". I've ".join(responses) + ". I will track this information and suggest a medical review if needed."
+        return {
+            "response": combined_response,
             "details": details,
         }
 
@@ -350,17 +548,6 @@ def _build_chat_response(message: str, user_id: str) -> dict:
         if stored_name:
             return {"response": f"Your name is {stored_name}.", "details": details}
         return {"response": "I don't have your name yet. Please tell me your name.", "details": details}
-
-    symptoms = _find_symptoms(normalized)
-    if symptoms:
-        existing_symptoms = _read_chat_memory(user_id, "symptoms") or []
-        merged = _merge_symptom_lists(existing_symptoms, symptoms)
-        _store_chat_memory(user_id, "symptoms", merged)
-        details["memory_actions"].append({"key": "symptoms", "value": merged})
-        return {
-            "response": f"I've noted your symptoms: {', '.join(merged)}. I can also compare these to similar past cases if you want.",
-            "details": details,
-        }
 
     if re.search(r"similar cases|similar patients|past cases|history|learn from past|learn from history", normalized, re.IGNORECASE):
         patterns = vectorstore.learn_patterns()
@@ -387,6 +574,12 @@ def _build_chat_response(message: str, user_id: str) -> dict:
             }
         return {"response": "I don't have a saved risk score yet. Run a prediction in the Prediction Studio first.", "details": details}
 
+    if re.search(r"what is my age|how old am i|do you know my age", normalized, re.IGNORECASE):
+        stored_age = _read_chat_memory(user_id, "age")
+        if stored_age is not None:
+            return {"response": f"You are {stored_age} years old.", "details": details}
+        return {"response": "I don't have your age yet. Please tell me how old you are.", "details": details}
+
     if re.search(r"memory|remember|forgot|do you know", normalized, re.IGNORECASE):
         profile = {
             "name": _read_chat_memory(user_id, "name"),
@@ -400,6 +593,9 @@ def _build_chat_response(message: str, user_id: str) -> dict:
         return {"response": "I don't have any memory for you yet. Share your name, age, symptoms, or risk information.", "details": details}
 
     if re.search(r"hello|hi|hey|good morning|good evening", normalized, re.IGNORECASE):
+        stored_name = _read_chat_memory(user_id, "name")
+        if stored_name:
+            return {"response": f"Hello {stored_name}! How can I help you today?", "details": details}
         return {"response": _build_chat_greeting(user_id), "details": details}
 
     return {
@@ -413,6 +609,8 @@ def initialize_chat_state():
         st.session_state.chat_history = []
     if "chat_user_id" not in st.session_state:
         st.session_state.chat_user_id = "user-001"
+    if "last_chat_details" not in st.session_state:
+        st.session_state.last_chat_details = {}
 
 
 def _render_chat_history():
@@ -425,91 +623,25 @@ def _render_chat_history():
             st.markdown(f"**HealthBot:** {text}")
 
 
+def _render_chat_response_details():
+    details = st.session_state.get("last_chat_details") or {}
+    memory_actions = details.get("memory_actions") or []
+    if memory_actions:
+        st.markdown("### Chatbot Memory Updates")
+        for action in memory_actions:
+            key = action.get("key")
+            value = action.get("value")
+            st.markdown(f"- **{key.replace('_', ' ').title()}:** {value}")
+    elif details:
+        st.markdown("### Chatbot Details")
+        st.write(details)
+
+
 def _render_memory_snapshot(user_id: str):
     st.markdown("### Saved Hindsight Memory")
     for key in ["name", "age", "symptoms", "previous_risk"]:
         value = _read_chat_memory(user_id, key)
         st.write(f"- **{key.replace('_', ' ').title()}:** {value if value is not None else 'No data saved yet.'}")
-
-
-def render_auth_screen():
-    st.markdown(
-        """
-        <div class="hero-card">
-            <div class="hero-eyebrow">Secure Access</div>
-            <div class="hero-title">Login or create an account</div>
-            <div class="hero-subtitle">
-                Sign in to open the advanced CardioInsight AI workspace with prediction history,
-                downloadable reports, and your personalized screening dashboard.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    info_col, auth_col = st.columns([1, 1.15], gap="large")
-    with info_col:
-        st.markdown(
-            """
-            <div class="panel-card">
-                <div class="panel-title">What unlocks after sign in</div>
-                <div class="panel-text">
-                    Access the heart risk prediction studio, clinician handoff notes, PDF exports,
-                    benchmark comparisons, iNSIGHTS integration, and a private session workspace.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            """
-            <div class="panel-card">
-                <div class="panel-title">Built for your project demo</div>
-                <div class="panel-text">
-                    The new authentication layer gives your app a more complete product feel and
-                    keeps the advanced dashboard behind a proper login flow.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with auth_col:
-        login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
-
-        with login_tab:
-            with st.form("login_form"):
-                login_email = st.text_input("Email", placeholder="you@example.com")
-                login_password = st.text_input("Password", type="password", placeholder="Enter your password")
-                login_submitted = st.form_submit_button("Login", use_container_width=True)
-
-            if login_submitted:
-                user, error_message = authenticate_user(login_email, login_password)
-                if error_message:
-                    st.error(error_message)
-                else:
-                    start_user_session(user)
-                    st.rerun()
-
-        with signup_tab:
-            with st.form("signup_form"):
-                signup_name = st.text_input("Full name", placeholder="Your name")
-                signup_email = st.text_input("Email address", placeholder="you@example.com")
-                signup_password = st.text_input("Create password", type="password", placeholder="At least 6 characters")
-                signup_confirm = st.text_input("Confirm password", type="password", placeholder="Re-enter password")
-                signup_submitted = st.form_submit_button("Create Account", use_container_width=True)
-
-            if signup_submitted:
-                if signup_password != signup_confirm:
-                    st.error("Passwords do not match.")
-                else:
-                    user, error_message = create_user(signup_name, signup_email, signup_password)
-                    if error_message:
-                        st.error(error_message)
-                    else:
-                        start_user_session(user)
-                        st.success("Account created successfully.")
-                        st.rerun()
 
 
 def inject_css():
@@ -2497,10 +2629,13 @@ st.set_page_config(page_title="CardioInsight AI", page_icon="H", layout="wide")
 inject_css()
 initialize_auth_db()
 initialize_auth_state()
-
-if not st.session_state.auth_user:
-    render_auth_screen()
-    st.stop()
+# Set default user to bypass login
+if "auth_user" not in st.session_state or st.session_state.auth_user is None:
+    st.session_state.auth_user = {"full_name": "Guest User", "email": "guest@example.com"}
+    st.session_state.patient_id = generate_patient_id()
+    st.session_state.assessment_history = []
+    st.session_state.latest_assessment = None
+    st.session_state.latest_xray_assessment = None
 
 st.markdown(
     """
@@ -2535,23 +2670,6 @@ reference_df = load_reference_data()
 initialize_app_state()
 
 with st.sidebar:
-    auth_user = st.session_state.auth_user
-    safe_full_name = html.escape(auth_user["full_name"])
-    safe_email = html.escape(auth_user["email"])
-    st.markdown(
-        f"""
-        <div class="auth-user-card">
-            <div class="auth-user-title">Signed In</div>
-            <div class="auth-user-name">{safe_full_name}</div>
-            <div class="auth-user-email">{safe_email}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if st.button("Logout", use_container_width=True):
-        logout_user()
-        st.rerun()
-    st.markdown("---")
     st.header("Model Snapshot")
     st.write(f"Model: `{bundle.get('model_name', type(model).__name__)}`")
     if metrics.get("accuracy") is not None:
@@ -3550,17 +3668,26 @@ with chat_tab:
 
     user_id = st.text_input("Chat User ID", value=st.session_state.chat_user_id)
     chat_input = st.text_area("Message", height=120, placeholder="Ask about your symptoms, risk, or similar patient cases...")
-    send_button = st.button("Send Message", use_container_width=True)
+    col1, col2 = st.columns([3, 1])
+    send_button = col1.button("Send Message", use_container_width=True)
+    reset_button = col2.button("Reset Conversation", use_container_width=True)
+
+    if reset_button:
+        st.session_state.chat_history = []
+        st.session_state.last_chat_details = {}
+        st.success("Conversation reset. You can start a new chat now.")
 
     if send_button and chat_input.strip():
         st.session_state.chat_user_id = user_id
         response = _build_chat_response(chat_input, user_id)
         st.session_state.chat_history.append({"speaker": "You", "message": chat_input})
-        st.session_state.chat_history.append({"speaker": "HealthBot", "message": response["response"]})
+        st.session_state.chat_history.append({"speaker": "HealthBot", "message": response.get("response", "Sorry, I couldn't answer that.")})
+        st.session_state.last_chat_details = response.get("details", {})
 
     if st.session_state.chat_history:
         st.markdown("### Conversation")
         _render_chat_history()
+        _render_chat_response_details()
 
     with st.expander("Memory Snapshot", expanded=True):
         _render_memory_snapshot(user_id)
